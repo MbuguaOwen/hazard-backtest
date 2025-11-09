@@ -1,0 +1,12 @@
+
+files:
+  ohlcv: "data/ticks/BTCUSDT/BTCUSDT-*-2025-*.csv"
+  alerts_csv: "results/alerts_used.csv"
+
+study:
+  atr_window: 60
+  horizon_min: 180
+  thr_atr: [2,3,4,6,8,10,15,20,30,50,75,100]
+
+out:
+  dir: "results/excursions"

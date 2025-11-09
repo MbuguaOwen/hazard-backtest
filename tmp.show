@@ -1,0 +1,437 @@
+import json, pathlib
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from src.io_ohlcv import read_any_ohlcv
+from src.atr_basic import atr
+from src.engine.direction import DirCfg, DriftCfg, CvdCfg, select_direction
+
+try:
+    from tqdm.auto import tqdm  # progress bar
+except Exception:
+    def tqdm(iterable, total=None, desc=None):
+        try:
+            n = len(iterable) if total is None else total
+        except Exception:
+            n = None
+        count = 0
+        for item in iterable:
+            count += 1
+            if n is not None:
+                print(f"\r{desc + ': ' if desc else ''}{count}/{n}", end="", flush=True)
+            elif count % 100 == 0:
+                print(f"\r{desc + ': ' if desc else ''}{count}", end="", flush=True)
+            yield item
+        print()
+
+
+def load_config(path: str) -> dict:
+    import yaml
+    return yaml.safe_load(open(path, "r", encoding="utf-8"))
+
+
+def _apply_costs(px: float, direction: int, fee_bps: float, slip_bps: float) -> Tuple[float, float]:
+    slip = px * (slip_bps * 1e-4)
+    px_adj = px + (-direction) * slip
+    fee = px * (fee_bps * 1e-4)
+    return px_adj, fee
+
+
+def enter_long_retest_second_break(
+    bars: pd.DataFrame,
+    t0: pd.Timestamp,
+    U: float,
+    eps_atr: float,
+    retest_atr: float,
+    max_wait_min: int,
+    atr_series: pd.Series,
+    min_wait_min: int = 3,
+) -> Tuple[Optional[pd.Timestamp], Optional[float], Optional[float], Dict]:
+    """Require first close >= U + eps*ATR, then a retest within +/- retest_atr*ATR around U, then a second close >= U + eps*ATR.
+    Returns (t_entry, entry_px, retest_depth_atr, diag) where diag contains first/retest/rebreak timestamps.
+    """
+    t_start = t0 + pd.Timedelta(minutes=min_wait_min)
+    t_end = t0 + pd.Timedelta(minutes=max_wait_min)
+    w = bars.loc[t_start:t_end]
+    first_ts = None
+    for ts, r in w.iterrows():
+        a = float(atr_series.loc[ts])
+        if r["close"] >= U + eps_atr * a:
+            first_ts = ts
+            break
+    if first_ts is None:
+        return None, None, None, {"first_break_ts": None, "retest_ts": None, "rebreak_ts": None}
+    touched = False
+    depth = None
+    retest_ts = None
+    for ts, r in bars.loc[first_ts:t_end].iterrows():
+        a = float(atr_series.loc[ts])
+        near_hi = U + retest_atr * a
+        near_lo = U - retest_atr * a
+        if r["low"] <= near_hi and r["high"] >= near_lo:
+            touched = True
+            depth = max(0.0, (U - float(r["low"])) / a)
+            if retest_ts is None:
+                retest_ts = ts
+        if touched and r["close"] >= U + eps_atr * a:
+            return ts, float(r["close"]), depth, {"first_break_ts": first_ts, "retest_ts": retest_ts, "rebreak_ts": ts}
+    return None, None, None, {"first_break_ts": first_ts, "retest_ts": retest_ts, "rebreak_ts": None}
+
+def enter_short_retest_second_break(
+    bars: pd.DataFrame,
+    t0: pd.Timestamp,
+    L: float,
+    eps_atr: float,
+    retest_atr: float,
+    max_wait_min: int,
+    atr_series: pd.Series,
+    min_wait_min: int = 3,
+) -> Tuple[Optional[pd.Timestamp], Optional[float], Optional[float], Dict]:
+    t_start = t0 + pd.Timedelta(minutes=min_wait_min)
+    t_end = t0 + pd.Timedelta(minutes=max_wait_min)
+    w = bars.loc[t_start:t_end]
+    first_ts = None
+    for ts, r in w.iterrows():
+        a = float(atr_series.loc[ts])
+        if r["close"] <= L - eps_atr * a:
+            first_ts = ts
+            break
+    if first_ts is None:
+        return None, None, None, {"first_break_ts": None, "retest_ts": None, "rebreak_ts": None}
+    touched = False
+    depth = None
+    retest_ts = None
+    for ts, r in bars.loc[first_ts:t_end].iterrows():
+        a = float(atr_series.loc[ts])
+        near_hi = L + retest_atr * a
+        near_lo = L - retest_atr * a
+        if r["low"] <= near_hi and r["high"] >= near_lo:
+            touched = True
+            depth = max(0.0, (float(r["high"]) - L) / a)
+            if retest_ts is None:
+                retest_ts = ts
+        if touched and r["close"] <= L - eps_atr * a:
+            return ts, float(r["close"]), depth, {"first_break_ts": first_ts, "retest_ts": retest_ts, "rebreak_ts": ts}
+    return None, None, None, {"first_break_ts": first_ts, "retest_ts": retest_ts, "rebreak_ts": None}
+
+
+def trade_metrics(trades: pd.DataFrame) -> Dict:
+    if len(trades) == 0:
+        return dict(n_trades=0, sum_pnl=0.0, mean_pnl=0.0, p_win=0.0, max_dd=0.0, sharpe=0.0, mean_r=0.0, sharpe_r=0.0)
+    pnl = trades["pnl"].fillna(0.0).values
+    eq = pnl.cumsum()
+    max_dd = float(np.max(np.maximum.accumulate(eq) - eq)) if len(eq) else 0.0
+    sharpe = float(np.mean(pnl) / np.std(pnl) * np.sqrt(365 * 24 * 60)) if np.std(pnl) > 1e-12 else 0.0
+    out = dict(
+        n_trades=int(len(trades)),
+        sum_pnl=float(np.sum(pnl)),
+        mean_pnl=float(np.mean(pnl)),
+        p_win=float((pnl > 0).mean()),
+        max_dd=max_dd,
+        sharpe=sharpe,
+    )
+    if "pnl_r" in trades.columns:
+        r = trades["pnl_r"].fillna(0.0).values
+        sharpe_r = float(np.mean(r) / np.std(r) * np.sqrt(365 * 24 * 60)) if np.std(r) > 1e-12 else 0.0
+        out.update(dict(mean_r=float(np.mean(r)), sharpe_r=sharpe_r))
+    return out
+
+
+def run_from_config(cfg_path: str):
+    cfg = load_config(cfg_path)
+    files = cfg.get("files", {})
+    strat = cfg.get("strategy", {})
+    out = cfg.get("out", {"dir": "results"})
+
+    # Load bars and ATR
+    bars = read_any_ohlcv(files["ohlcv"]).sort_values("ts").set_index("ts")
+    bars["ATR"] = atr(bars[["open", "high", "low", "close"]], window=int(strat.get("atr_window", 60)))
+
+    # Alerts
+    alerts = pd.read_csv(files["alerts_csv"]) if files.get("alerts_csv") else pd.DataFrame(columns=["t_alert"])
+    if "t_alert" not in alerts.columns:
+        raise ValueError("files.alerts_csv must contain 't_alert'")
+    alerts = pd.to_datetime(alerts["t_alert"], utc=True, errors="coerce").dt.floor("min")
+
+    # Direction config
+    d_cfg = strat.get("direction", {})
+    dir_cfg = DirCfg(
+        mode=d_cfg.get("mode", "none"),
+        drift=DriftCfg(
+            M_min=int(d_cfg.get("drift", {}).get("M_min", 3)),
+            eps_atr=float(d_cfg.get("drift", {}).get("eps_atr", 0.10)),
+        ),
+        cvd=CvdCfg(
+            source=d_cfg.get("cvd", {}).get("source", "bar_proxy"),
+            baseline_min=int(d_cfg.get("cvd", {}).get("baseline_min", 240)),
+            z_thr=float(d_cfg.get("cvd", {}).get("z_thr", 0.8)),
+        ),
+        anchor_price=d_cfg.get("anchor_price", "select"),
+    )
+
+    print("[Cfg] direction.mode =", dir_cfg.mode)
+    k_breakout = float(strat["k_breakout"])
+    sl_mult = float(strat["sl_mult"])
+    tp_mult = float(strat["tp_mult"])
+    be_frac = float(strat.get("be_frac", 0.60))
+    trail_mult = strat.get("trail_mult")
+    horizon_min = int(strat.get("horizon_min", 180))
+    entry_recalc_atr = bool(strat.get("entry_recalc_atr", True))
+    fee_bps = float(strat.get("fee_bps", 1.0))
+    slip_bps = float(strat.get("slip_bps", 0.5))
+
+    ec = strat.get("entry_confirm", {})
+    assert ec.get("mode", "retest_second_break") == "retest_second_break", "Wrong entry mode active."
+    assert dir_cfg.mode in ("hybrid_and", "hybrid_adaptive", "drift", "cvd"), "Direction selector not active."
+    epsilon_atr = float(ec.get("epsilon_atr", 0.05))
+    retest_atr = float(ec.get("retest_atr", 0.10))
+    min_wait_min = int(ec.get("min_wait_min", 3))
+    range_min = int(ec.get("range_min", min_wait_min))
+    adverse_guard_atr = float(ec.get("adverse_guard_atr", 0.8))
+    guard_window_min = int(ec.get("guard_window_min", 8))
+    max_wait_min = int(ec.get("max_wait_min", 60))
+
+    # Intersect alerts with available bars and ensure full horizon coverage
+    bars_idx = bars.index
+    t0, t1 = bars_idx.min(), bars_idx.max()
+    h_exit = pd.Timedelta(minutes=horizon_min)
+    alerts = alerts[(alerts >= t0) & (alerts <= (t1 - h_exit))]
+    alerts = pd.DatetimeIndex(alerts.sort_values().unique())
+
+    # Save alerts used
+    pathlib.Path(out["dir"]).mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"t_alert": alerts}).to_csv(f"{out['dir']}/alerts_used.csv", index=False)
+
+    # Simulation
+    trades = []
+    trade_log = []
+    n_adverse_skips = 0
+    n_postsel_breakouts = 0
+    for t_gate in tqdm(alerts, desc="Simulating alerts"):
+        if t_gate not in bars.index:
+            idx = bars.index.searchsorted(t_gate)
+            if idx >= len(bars):
+                continue
+            t_gate = bars.index[idx]
+
+        row_gate = bars.loc[t_gate]
+        atr_ref = float(row_gate["ATR"]) if pd.notna(row_gate["ATR"]) else np.nan
+        if not np.isfinite(atr_ref) or atr_ref <= 0:
+            continue
+
+        bias, dinfo = select_direction(bars, t_gate, atr_ref, dir_cfg)
+        if dir_cfg.mode != "none" and bias is None:
+            trade_log.append({
+                "t_alert": t_gate, "skip": "direction",
+                **{k: dinfo.get(k) for k in ["t_sel", "drift", "drift_dir", "drift_sig", "cvd_z", "cvd_dir", "cvd_sig", "reason"]}
+            })
+            continue
+
+        horizon_ts = t_gate + pd.Timedelta(minutes=horizon_min)
+        t_sel = pd.to_datetime(dinfo.get("t_sel")) if dinfo and dinfo.get("t_sel") else t_gate
+        idx_sel = bars.index[bars.index.searchsorted(t_sel)]
+        p0 = float(bars.loc[idx_sel]["close"]) if dir_cfg.anchor_price == "select" else float(row_gate["close"])
+        atr_anchor = float(bars.loc[bars.index[bars.index.searchsorted(t_sel)]]["ATR"])
+        atr_levels = atr_anchor if entry_recalc_atr else float(row_gate["ATR"])  
+        U = p0 + k_breakout * atr_levels
+        L = p0 - k_breakout * atr_levels
+
+        # Adverse guard over max wait window
+        guard_end = t_sel + pd.Timedelta(minutes=guard_window_min)
+        w_guard = bars.loc[t_sel:guard_end]
+        if bias == +1:
+            adverse = (p0 - float(w_guard["low"].cummin().min())) / atr_anchor if len(w_guard) else 0.0
+        else:
+            adverse = (float(w_guard["high"].cummax().max()) - p0) / atr_anchor if len(w_guard) else 0.0
+        if adverse >= adverse_guard_atr:
+            trade_log.append({"t_alert": t_gate, "skip": "adverse_guard", "adverse_atr": float(adverse), "t_sel": t_sel})
+            n_adverse_skips += 1
+            continue
+
+        # Post-selection range breakout (Donchian)
+        t_start = t_sel + pd.Timedelta(minutes=min_wait_min)
+        rng = bars.loc[t_sel:t_start]
+        high_sel = float(rng["high"].max()) if len(rng) else p0
+        low_sel  = float(rng["low"].min()) if len(rng) else p0
+        U2, L2 = high_sel, low_sel
+
+        # Entry using explicit long/short retest-second-break off U2/L2
+        if bias == +1:
+            t_entry, entry, ret_depth, diag = enter_long_retest_second_break(bars, t_sel, U2, epsilon_atr, retest_atr, max_wait_min, bars["ATR"], min_wait_min=min_wait_min)
+        else:
+            t_entry, entry, ret_depth, diag = enter_short_retest_second_break(bars, t_sel, L2, epsilon_atr, retest_atr, max_wait_min, bars["ATR"], min_wait_min=min_wait_min)
+        if diag.get("first_break_ts") is not None:
+            n_postsel_breakouts += 1
+        if t_entry is None or entry is None:
+            # Instrument skip reasons
+            if diag.get("first_break_ts") is None:
+                trade_log.append({"t_alert": t_gate, "skip": "no_first_break", "t_sel": t_sel})
+            elif diag.get("retest_ts") is None:
+                trade_log.append({"t_alert": t_gate, "skip": "no_retest", "t_sel": t_sel, "first_break_ts": diag.get("first_break_ts")})
+            else:
+                trade_log.append({"t_alert": t_gate, "skip": "no_rebreak", "t_sel": t_sel, "first_break_ts": diag.get("first_break_ts"), "retest_ts": diag.get("retest_ts")})
+            continue
+
+        # Entry ATR base
+        atr_base = float(bars.loc[t_entry, "ATR"]) if entry_recalc_atr else atr_ref
+        if not np.isfinite(atr_base) or atr_base <= 0:
+            continue
+
+        sl = entry - bias * sl_mult * atr_base
+        tp = entry + bias * tp_mult * atr_base
+        qty = 1.0  # unit size; PnL in price units
+        sl_dist_price = sl_mult * atr_base
+
+        entry_adj, fee_e = _apply_costs(entry, bias, fee_bps, slip_bps)
+        best = entry
+        sl_working = sl
+        be_price = entry + bias * be_frac * (tp - entry)
+        moved_to_be = False
+
+        # Walk forward for exit
+        exit_reason = "TIME"
+        touched_sl = False
+        for ts, r in bars.loc[t_entry:horizon_ts].iterrows():
+            hi, lo, cl = float(r["high"]), float(r["low"]), float(r["close"])
+            hit_tp = (hi >= tp) if bias == +1 else (lo <= tp)
+            hit_sl = (lo <= sl_working) if bias == +1 else (hi >= sl_working)
+
+            if hit_tp and hit_sl:
+                exit_px = tp
+                t_exit = ts
+                exit_reason = "TP"
+                exit_adj, fee_x = _apply_costs(exit_px, -bias, fee_bps, slip_bps)
+                pnl = (exit_adj - entry_adj) * bias * qty - (fee_e + fee_x) * qty
+                pnl_r = pnl / sl_dist_price if sl_dist_price > 0 else 0.0
+                trades.append(dict(
+                    t_alert=t_gate, t_entry=t_entry, t_exit=t_exit, dir=bias,
+                    bias=bias, entry=entry, exit=exit_px, pnl=float(pnl), pnl_r=float(pnl_r), atr_anchor=float(atr_levels),
+                    exit_reason=exit_reason, touched_sl=touched_sl,
+                    entry_mode="retest_second_break", retest_depth_atr=ret_depth,
+                    t_sel=t_sel, U2=U2, L2=L2,
+                    first_break_ts=diag.get("first_break_ts"), retest_ts=diag.get("retest_ts"), rebreak_ts=diag.get("rebreak_ts"),
+                    adverse_atr_at_entry=float(adverse),
+                    drift=dinfo.get("drift") if dinfo else None,
+                    drift_sig=dinfo.get("drift_sig") if dinfo else None,
+                    cvd_z=dinfo.get("cvd_z") if dinfo else None,
+                    cvd_sig=dinfo.get("cvd_sig") if dinfo else None,
+                    direction_reason=dinfo.get("reason") if dinfo else None,
+                ))
+                break
+
+            if hit_tp:
+                exit_px = tp
+                t_exit = ts
+                exit_reason = "TP"
+                exit_adj, fee_x = _apply_costs(exit_px, -bias, fee_bps, slip_bps)
+                pnl = (exit_adj - entry_adj) * bias * qty - (fee_e + fee_x) * qty
+                pnl_r = pnl / sl_dist_price if sl_dist_price > 0 else 0.0
+                trades.append(dict(
+                    t_alert=t_gate, t_entry=t_entry, t_exit=t_exit, dir=bias,
+                    bias=bias, entry=entry, exit=exit_px, pnl=float(pnl), pnl_r=float(pnl_r), atr_anchor=float(atr_levels),
+                    exit_reason=exit_reason, touched_sl=touched_sl,
+                    entry_mode="retest_second_break", retest_depth_atr=ret_depth,
+                    t_sel=t_sel, U2=U2, L2=L2,
+                    first_break_ts=diag.get("first_break_ts"), retest_ts=diag.get("retest_ts"), rebreak_ts=diag.get("rebreak_ts"),
+                    adverse_atr_at_entry=float(adverse),
+                    drift=dinfo.get("drift") if dinfo else None,
+                    drift_sig=dinfo.get("drift_sig") if dinfo else None,
+                    cvd_z=dinfo.get("cvd_z") if dinfo else None,
+                    cvd_sig=dinfo.get("cvd_sig") if dinfo else None,
+                    direction_reason=dinfo.get("reason") if dinfo else None,
+                ))
+                break
+
+            if hit_sl:
+                exit_px = sl_working
+                t_exit = ts
+                exit_reason = "SL"
+                touched_sl = True
+                exit_adj, fee_x = _apply_costs(exit_px, -bias, fee_bps, slip_bps)
+                pnl = (exit_adj - entry_adj) * bias * qty - (fee_e + fee_x) * qty
+                pnl_r = pnl / sl_dist_price if sl_dist_price > 0 else 0.0
+                trades.append(dict(
+                    t_alert=t_gate, t_entry=t_entry, t_exit=t_exit, dir=bias,
+                    bias=bias, entry=entry, exit=exit_px, pnl=float(pnl), pnl_r=float(pnl_r), atr_anchor=float(atr_levels),
+                    exit_reason=exit_reason, touched_sl=touched_sl,
+                    entry_mode="retest_second_break", retest_depth_atr=ret_depth,
+                    t_sel=t_sel, U2=U2, L2=L2,
+                    first_break_ts=diag.get("first_break_ts"), retest_ts=diag.get("retest_ts"), rebreak_ts=diag.get("rebreak_ts"),
+                    adverse_atr_at_entry=float(adverse),
+                    drift=dinfo.get("drift") if dinfo else None,
+                    drift_sig=dinfo.get("drift_sig") if dinfo else None,
+                    cvd_z=dinfo.get("cvd_z") if dinfo else None,
+                    cvd_sig=dinfo.get("cvd_sig") if dinfo else None,
+                    direction_reason=dinfo.get("reason") if dinfo else None,
+                ))
+                break
+
+            best = max(best, hi) if bias == +1 else min(best, lo)
+            if not moved_to_be and ((bias == +1 and cl >= be_price) or (bias == -1 and cl <= be_price)):
+                sl_working = entry
+                moved_to_be = True
+            if moved_to_be and trail_mult is not None:
+                trail_dist = float(trail_mult) * atr_base
+                tgt = best - bias * trail_dist
+                if (bias == +1 and tgt > sl_working) or (bias == -1 and tgt < sl_working):
+                    sl_working = tgt
+        else:
+            # TIME exit
+            exit_px = float(bars.loc[horizon_ts, "close"]) if horizon_ts in bars.index else float(bars.iloc[-1]["close"]) 
+            t_exit = horizon_ts if horizon_ts in bars.index else bars.index[-1]
+            exit_adj, fee_x = _apply_costs(exit_px, -bias, fee_bps, slip_bps)
+            pnl = (exit_adj - entry_adj) * bias * qty - (fee_e + fee_x) * qty
+            pnl_r = pnl / sl_dist_price if sl_dist_price > 0 else 0.0
+            trades.append(dict(
+                t_alert=t_gate, t_entry=t_entry, t_exit=t_exit, dir=bias,
+                bias=bias, entry=entry, exit=exit_px, pnl=float(pnl), pnl_r=float(pnl_r), atr_anchor=float(atr_levels),
+                exit_reason="TIME", touched_sl=touched_sl,
+                entry_mode="retest_second_break", retest_depth_atr=ret_depth,
+                t_sel=t_sel, U2=U2, L2=L2,
+                first_break_ts=diag.get("first_break_ts"), retest_ts=diag.get("retest_ts"), rebreak_ts=diag.get("rebreak_ts"),
+                adverse_atr_at_entry=float(adverse),
+                drift=dinfo.get("drift") if dinfo else None,
+                drift_sig=dinfo.get("drift_sig") if dinfo else None,
+                cvd_z=dinfo.get("cvd_z") if dinfo else None,
+                cvd_sig=dinfo.get("cvd_sig") if dinfo else None,
+                direction_reason=dinfo.get("reason") if dinfo else None,
+            ))
+
+    trades_df = pd.DataFrame(trades)
+    pathlib.Path(out["dir"]).mkdir(parents=True, exist_ok=True)
+    if len(trades_df):
+        trades_df.to_csv(f"{out['dir']}/vol_bracket_trades.csv", index=False)
+    # Metrics
+    metrics = trade_metrics(trades_df)
+    metrics["alerts"] = int(len(alerts))
+
+    # Direction summary
+    from collections import Counter
+    reasons = Counter([t.get("direction_reason") for t in trades if t.get("direction_reason")])
+    bias_counts = {
+        "+1": sum(1 for t in trades if t.get("dir") == +1),
+        "-1": sum(1 for t in trades if t.get("dir") == -1),
+        "None": 0,
+    }
+    print("[Direction] reasons:", dict(reasons))
+    print("[Direction] bias counts:", bias_counts)
+    modes = Counter([t.get("entry_mode") for t in trades])
+    print("[Entry] modes:", dict(modes))
+    skips = Counter([t.get("skip") for t in trade_log if t.get("skip")])
+    print("[Skips]", dict(skips))
+
+    json.dump(metrics, open(f"{out['dir']}/vol_bracket_metrics.json", "w"), indent=2, default=float)
+    print(json.dumps(metrics, indent=2, default=float))
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="configs/vol_bracket.yaml")
+    args = ap.parse_args()
+    run_from_config(args.config)
+
+
+

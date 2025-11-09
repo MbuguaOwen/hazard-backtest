@@ -1,0 +1,70 @@
+project:
+  symbol: "BTCUSDT"
+  tz: "UTC"
+
+files:
+  # Use your data glob
+  ohlcv: "data/ticks/BTCUSDT/BTCUSDT-*-2025-*.csv"
+  alerts_csv: "results/alerts_used.csv"
+
+strategy:
+  horizon_min: 180
+  atr_window: 60
+  entry_recalc_atr: true
+
+  # risk/targets
+  k_breakout: 1.50
+  sl_mult: null           # use structure stop (see §C)
+  tp_mult: 6.0
+  be_frac: 0.60
+  trail_mult: 1.0
+
+  entry_confirm:
+    mode: "retest_second_break"
+
+    # tight pocket (aligned with study q50–q75)
+    retest_atr: 0.45        # was 0.30–0.40 → let 28 “retest_depth” skips through
+    epsilon_atr: 0.08
+
+    # formation
+    min_wait_min: 4
+    range_min: 5
+    max_wait_min: 75        # was 45–60; reduces “no_first_break” (13)
+
+    # early-noise guard (aligned below q75)
+    adverse_guard_atr: 2.8  # was ~1.8–2.2 → cut “adverse_guard” (50) materially
+    guard_window_min: 8
+
+    # impulse
+    impulse:
+      min_body_atr: 0.35    # was 0.40 → reduce “impulse_body” (8)
+      min_true_range_atr: 0.80  # was 0.90 → reduce “impulse_tr” (12)
+
+    # flow (SIGNED in code)
+    flow:
+      cvd_slope_min: 0.00
+      cvd_delta_z_min: 0.30   # was 0.50 → reduce “flow_dz” (7)
+
+  stop:
+    mode: "structure"
+    buffer_atr: 0.15
+    cap_atr: 2.0
+
+  direction:
+    mode: "hybrid_adaptive"   # <- NOT "none"
+    anchor_price: "select"
+    drift:
+      M_min: 3
+      eps_atr: 0.03
+    cvd:
+      source: "bar_proxy"
+      baseline_min: 240
+      z_thr: 0.25
+      z_strong: 1.20
+
+  # costs
+  fee_bps: 1.0
+  slip_bps: 0.5
+
+out:
+  dir: "results"

@@ -1,0 +1,26 @@
+files:
+  alerts_csv: "results/alerts_used.csv"
+  minutes_parquet: "results/cache/minutes/minutes_f166517ddd67.parquet"
+  micro_parquet:   "results/cache/microbars/micro_5s_f166517ddd67.parquet"
+
+study:
+  horizon_min: 180
+  k_list: [3.0]      # tighten during calibration; widen after
+  m_list: [1.0, 1.5]
+  donchian_window: 60
+  gate_pad_s: 15
+
+absorption:
+  micro_tf: "5s"     # must match the parquet
+  lookback_s: 60
+  alpha: 0.8
+  # your code may still call this z_delta_thr; it is the SCORE threshold:
+  z_delta_thr: 1.8
+  wick_bias_min: 0.60
+  donchian_prox_atr: null
+  lambda_drop: false
+
+cache:
+  microbars_dir: "results/cache/microbars"
+  enable: true
+  force_rebuild: false

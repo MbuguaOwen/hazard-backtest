@@ -1,0 +1,13 @@
+{
+  "n":102.0,
+  "adverse_guard_q50":1.6939127753,
+  "adverse_guard_q75":2.9083833435,
+  "retest_depth_q50":0.2278296191,
+  "retest_depth_q75":0.4533335296,
+  "first_break_rate":0.7941176471,
+  "rebreak_rate":0.7745098039,
+  "max_side_q50":7.4277036251,
+  "max_side_q75":13.25038468,
+  "clean_run_rate_ge6":0.5784313725,
+  "clean_run_rate_ge10":0.362745098
+}
